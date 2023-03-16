@@ -1,1 +1,13 @@
 r255/
+*.png
+logs*
+screwed_expl*
+triple_fix*
+exploratory_dagger*
+fixed_exploratory*
+double_fix*
+double_broken*
+dagger_example*
+*.pt
+*.csv
+*.pptx

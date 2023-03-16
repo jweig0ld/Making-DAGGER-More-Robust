@@ -3,7 +3,7 @@ import os
 import random
 import torch
 import numpy as np
-import lightning.pytorch as pl
+import pytorch_lightning as pl
 
 from huggingface_sb3 import load_from_hub
 from stable_baselines3 import PPO
@@ -20,37 +20,6 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from copy import deepcopy
 
-from dataset import ExploratoryDaggerDataset
-
-
-"""
-TODO:
-
-1. (DONE) Load the pre-trained weights from Lunar Lander for the expert.
-2. (DONE) Find out how long trajectories are in the other implementation.
-3. (DONE) Find out how many initial trajectories that the other one starts with (ANS = 0).
-4. (DONE) Run inference on the expert agent to generate the same initial trajectories (NO NEED TO).
-5. (DONE) Find out how many trajectories DAGGER generates before a training step.
-6. (DONE) Find out what their ultimate training termination condition is.
-
-1. (DONE) For every observation, select the top-k highest actions.
-2. (DONE) Create k copies of the environment, and simulate taking different actions in each.
-3. (DONE) Find out what the RND paper uses to determine the greatest difference in output (MSE).
-4. (DONE) Run the resulting k new observations through the frozen and unfrozen networks.
-5. (DONE) Find out what loss the RND paper uses.
-6. (DONE) Take the action which results in the highest difference.
-7. (DONE) Find out what the beta schedule that they use for the expert is (15 rounds).
-8. (DONE) Find out approximately how many training steps 15 rounds is. (at least 500 timesteps). 500 * 15 = 7500.
-9. (DONE) Implement the beta schedule s.t. if a random number is less than the beta, we query the agent.
-10. (DONE) Accumulate the action taken in the global dataset and query the expert for the correct one.
-11. (DONE) Find out how to write a trivial BC training step/loop using PyTorch Lightning.
-12. (DONE) Find out what loss they were using for their network (entropy-regularised NLL loss).
-13. (DONE) Find out how to write a naive PyTorch DataLoader.
-14. (DONE) Write a PyTorch Dataset class.
-15. (DONE) Find out how I should perform the BC training step.
-16. (DONE) Implement a DataLoader for the Dataset.
-17. (DONE) Perform a BC training step through the entire dataset.
-"""
 
 # CONFIG
 ENV = 'Lunar Lander' # 'Lunar Lander' or 'Bipedal Walker'
@@ -59,6 +28,7 @@ rng = np.random.default_rng(0)
 CHECKPOINT_RATE = 1000
 LOGDIR = 'logs'
 version = 9
+RND = False
 
 # DAGGER PARAMS
 BATCH_SIZE = 32
@@ -70,6 +40,35 @@ BC_EPOCHS = 4 # Number of BC epochs performed in a training step before returnin
 
 # RND PARAMS
 H_DIM = 32
+
+
+def compute_model_statistics(model: pl.LightningModule):
+    n_eval_episodes = 5 # Same as is used in the imitation implementation
+    all_rewards = []
+    for episode in range(n_eval_episodes):
+        env = make_vec_env("LunarLander-v2", n_envs=1)
+        obs = env.reset()
+
+        episode_rewards = []
+        done = False
+        while not done:
+            action, value, log_prob = model(torch.from_numpy(obs))
+            obs, reward, done, info = env.step(action.numpy())
+            episode_rewards.append(reward.item())
+        
+        all_rewards.append(episode_rewards)
+    
+    mean_episode_length = sum([len(ep_rewards) for ep_rewards in all_rewards]) / n_eval_episodes
+    mean_episode_reward = sum([sum(ep_rewards) for ep_rewards in all_rewards]) / n_eval_episodes
+    
+    max_length = max(len(lst) for lst in all_rewards)
+    padded_all_rewards = [lst + [0]*(max_length - len(lst)) for lst in all_rewards]
+
+    all_rewards_th = torch.tensor(padded_all_rewards)
+    episode_rewards_th = torch.sum(all_rewards_th, dim=1)
+    std_episode_reward = torch.std(episode_rewards_th)
+
+    return mean_episode_length, mean_episode_reward, std_episode_reward
 
 
 class ExploratoryDagger(pl.LightningModule):
@@ -87,8 +86,7 @@ class ExploratoryDagger(pl.LightningModule):
             nn.Softmax()
         )
 
-        self.frozen_net = type(self.random_net)(in_dim, h_dim, out_dim)
-        self.frozen_net.load_state_dict(self.random_net.state_dict())
+        self.frozen_net = deepcopy(self.random_net)
 
         # Duplicating DAGGER policy architecture
         self.policy = FeedForward32Policy(
@@ -106,10 +104,14 @@ class ExploratoryDagger(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        y_hat = self(x)
-        loss = F.nll_loss(y, y_hat)
+        # actions, values, log_probs = self(x)
+        # print(f'X Batch: {x.shape}')
+        log_probs = model.policy.get_distribution(x).distribution.logits
+        loss = F.nll_loss(log_probs, y)
         # # Logging to TensorBoard (if installed) by default
         self.log("train_loss", loss)
+
+        # loss += F.mse(self.random_net(x), self.frozen_net(x))
         return loss
 
     def configure_optimizers(self):
@@ -135,10 +137,11 @@ if TRAIN:
     print("Commencing Training...")
 
     model = ExploratoryDagger(k=K, 
-                              in_dim=env.observation_space.n,
+                              in_dim=env.observation_space.shape[0],
                               h_dim=H_DIM,
-                              out_dim=env.action_space.n)
-    trainer = pl.Trainer()
+                              out_dim=1,
+                              observation_space=env.observation_space,
+                              action_space=env.action_space)
 
     rnd_loss = nn.MSELoss(reduction='none')
     dataset = ExploratoryDaggerDataset()
@@ -159,32 +162,58 @@ if TRAIN:
             print(f'Obs: {obs}')
 
             done = False
+            episode_actions = []
+            episode_reward = 0
 
             # Generate a trajectory of data
             while not done:
                 action = None
                 if random.random() < model.beta_schedule(timestep=total_timesteps, max_timesteps=MAX_TIMESTEPS):
                     # Query expert for action
-                    action = expert(obs)
+                    # print('Queried the expert for an action.')
+                    action, _ = expert.predict(obs)
                 else:
-                    probs = model(obs)
-                    top_k_actions = torch.topk(probs, model.k)[1] # Argmax returns the actions
+                    # print('Queried the agent for an action.')
+                    obs = torch.tensor(obs)
 
-                    # Simulate taking the top-k actions in independent environments
-                    env_copies, fut_obs = [deepcopy(env) for _ in range(K)], []
-                    for i in range(K):
-                        # Get the observations after one future action
-                        obs_prime, _, _, _ = env_copies[i].step(top_k_actions[i])
-                        fut_obs.append(obs_prime)
+                    if RND: 
+                        actions = torch.tensor([0., 1., 2., 3.])
+                        log_probs = model.policy.get_distribution(obs).log_prob(actions)
+                        top_k_actions = torch.topk(log_probs, model.k)[1] # Argmax returns the actions
+                        
+                        # Simulate taking the top-k actions in independent environments
+                        env_copies, fut_obs = [make_vec_env("LunarLander-v2", n_envs=1) for _ in range(K)], []
+                        for i in range(K):
+                            env_copies[i].reset()
+
+                        for past_action in episode_actions:
+                            # Run the copied environments forward to the current state
+                            for i in range(K):
+                                env_copies[i].step(past_action)
+
+                        for i in range(K):
+                            # Get the observations after one future action
+                            candidate_action = np.array([top_k_actions[i]])
+                            obs_prime, _, _, _ = env_copies[i].step(candidate_action)
+                            fut_obs.append(torch.from_numpy(obs_prime))
+                        
+                        # Pass the observations through the frozen and unfrozen networks and pick
+                        # the one with the highest difference. 
+                        frozen_outs = torch.tensor([model.frozen_net(fut) for fut in fut_obs], requires_grad=False)
+                        random_outs = torch.tensor([model.random_net(fut) for fut in fut_obs])
+                        mse = rnd_loss(random_outs, frozen_outs) # We are expecting this to be (k x 1)
+                        action = np.array([torch.argmax(mse, dim=0)])
+                    else:
+                        action, value, log_prob = model(obs)
+                        action = action.numpy()
                     
-                    # Pass the observations through the frozen and unfrozen networks and pick
-                    # the one with the highest difference. 
-                    frozen_outs = torch.tensor([model.frozen_net(fut) for fut in fut_obs], requires_grad=False)
-                    random_outs = torch.tensor([model.random_net(fut) for fut in fut_obs])
-                    mse = rnd_loss(random_outs, frozen_outs) # We are expecting this to be (k x 1)
-                    action = torch.argmax(mse, dim=0)
-                    
+                
+                episode_actions.append(action)
+
+                # print(f'Action: {action}.')
                 obs, reward, done, info = env.step(action)
+                episode_reward += reward
+
                 epoch_timesteps += 1
                 total_timesteps += 1
                 epoch_observations.append(obs)
@@ -193,17 +222,30 @@ if TRAIN:
 
         # After sufficient training data has been collected, query the expert on the observations
         # during the dataset aggregation period
-        epoch_expert_actions = expert(epoch_observations) # (timesteps x action_space)
+        # epoch_expert_actions, _ = expert.predict(epoch_observations) # (timesteps x action_space)
+        _expert_outs = [expert.predict(observation) for observation in epoch_observations]
+        epoch_expert_actions = [action for (action, _) in _expert_outs]
         dataset.aggregate(epoch_observations, epoch_expert_actions)
         
         epoch_observations = []
 
         ############ BC Training Step ############
         model = ExploratoryDagger(k=K, 
-                              in_dim=env.observation_space.n,
+                              in_dim=env.observation_space.shape[0],
                               h_dim=H_DIM,
-                              out_dim=env.action_space.n)
+                              out_dim=1,
+                              observation_space=env.observation_space,
+                              action_space=env.action_space)
+        
         
         dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE)
+        trainer = pl.Trainer(max_epochs=BC_EPOCHS)
         trainer.fit(model, dataloader)
+
+        ############ Validation & Statistics ############
+        mean_episode_length, mean_episode_reward, std_episode_reward = compute_model_statistics(model)
+        print(f'Mean Episode Length: {mean_episode_length}. Mean Episode Reward: {mean_episode_reward}. Std Episode Reward: {std_episode_reward}.')
+
+        print(f'BC Step Complete. Total Timesteps: {total_timesteps}.')
         
+print('Training Complete.')
